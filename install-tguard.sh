@@ -26,8 +26,6 @@ TG_REPO="Adieuwhine/TGuard"
 TG_BINARY="tguard"
 TG_INSTALL_DIR="/opt"
 TG_BIN_PATH="${TG_INSTALL_DIR}/${TG_BINARY}"
-TG_LINK_DIR="/usr/local/bin"
-TG_LINK_PATH="${TG_LINK_DIR}/${TG_BINARY}"
 TG_LATEST_URL="https://github.com/${TG_REPO}/releases/latest/download"
 TG_DEV_MODE=false
 
@@ -75,13 +73,14 @@ cleanup_old_install() {
 
     local BIN_CANDIDATES=(
         "/opt/tguard"
+        "/usr/local/bin/tguard-bin"
         "/usr/bin/tguard"
         "/usr/local/sbin/tguard"
         "/bin/tguard"
         "/sbin/tguard"
     )
     for f in "${BIN_CANDIDATES[@]}"; do
-        if [[ -e "$f" ]] && [[ "$f" != "/usr/local/bin/tguard" ]]; then
+        if [[ -e "$f" ]]; then
             FOUND+=("$f")
             rm -f "$f"
         fi
@@ -89,7 +88,6 @@ cleanup_old_install() {
 
     local SCRIPT_CANDIDATES=(
         "/usr/local/bin/antiscan-aggregate-logs.sh"
-        "/usr/bin/tguard"
     )
     for f in "${SCRIPT_CANDIDATES[@]}"; do
         if [[ -e "$f" ]]; then
@@ -258,9 +256,6 @@ install_binary() {
     cp "${temp_file}" "${TG_BIN_PATH}"
     chmod +x "${TG_BIN_PATH}"
     rm -f "${temp_file}"
-
-    mkdir -p "${TG_LINK_DIR}"
-    ln -sf "${TG_BIN_PATH}" "${TG_LINK_PATH}"
 }
 
 tg_install() {
@@ -282,7 +277,6 @@ tg_install() {
         echo -e "\n  ${RED}❌ Ошибка установки${NC}"
         return 1
     }
-    echo -e "  ${DIM}Симлинк:${NC} ${TG_LINK_PATH} → ${TG_BIN_PATH}"
 
     if [[ -x "${TG_BIN_PATH}" ]]; then
         local ver
@@ -766,7 +760,7 @@ esac
 EOF
 
 chmod +x "$MANAGER_PATH"
-ln -s "$MANAGER_PATH" "$LINK_PATH"
+ln -sf "$MANAGER_PATH" "$LINK_PATH"
 
 if [[ ! -x /opt/tguard ]]; then
     /opt/tguard-manager.sh install
