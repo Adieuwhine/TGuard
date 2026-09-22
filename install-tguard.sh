@@ -10,7 +10,7 @@ cat > "$MANAGER_PATH" << 'EOF'
 #!/bin/bash
 set -u
 
-VERSION="0.1"
+VERSION="0.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -65,6 +65,45 @@ check_firewall_safety() {
             DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent netfilter-persistent
         fi
     fi
+}
+
+fix_ipv6_ufw() {
+    if ! command -v ip6tables >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! ip6tables -L SCANNERS-BLOCK -n &>/dev/null; then
+        return 0
+    fi
+
+    if ! ip6tables -L ufw6-before-input -n &>/dev/null; then
+        return 0
+    fi
+
+    if ip6tables -L ufw6-before-input -n 2>/dev/null | grep -q "SCANNERS-BLOCK"; then
+        return 0
+    fi
+
+    echo -e "  ${YELLOW}⚠ Обнаружена проблема: SCANNERS-BLOCK (IPv6) не подключена к ufw6-before-input${NC}"
+    echo -e "  ${BLUE}▸ Восстановление связи IPv6...${NC}"
+
+    ip6tables -I ufw6-before-input 1 -j SCANNERS-BLOCK 2>/dev/null
+
+    if ip6tables -L ufw6-before-input -n 2>/dev/null | grep -q "SCANNERS-BLOCK"; then
+        echo -e "  ${GREEN}✓ Цепочка IPv6 подключена к UFW${NC}"
+    else
+        echo -e "  ${RED}✗ Не удалось подключить цепочку IPv6${NC}"
+        return 1
+    fi
+
+    if [[ -f /etc/ufw/before6.rules ]]; then
+        if ! grep -q "SCANNERS-BLOCK" /etc/ufw/before6.rules 2>/dev/null; then
+            sed -i '/^COMMIT$/i -A ufw6-before-input -j SCANNERS-BLOCK' /etc/ufw/before6.rules
+            echo -e "  ${GREEN}✓ Правило добавлено в /etc/ufw/before6.rules${NC}"
+        fi
+    fi
+
+    return 0
 }
 
 check_for_updates() {
@@ -690,6 +729,10 @@ update_lists() {
 
     echo -e "\n  ${BLUE}▸ Применение...${NC}"
     "${TG_BIN_PATH}" full -u "$LIST_ANTISCAN" -u "$LIST_GOV" -u "$LIST_MISC" --enable-logging
+
+    echo ""
+    fix_ipv6_ufw
+
     echo -e "\n  ${GREEN}✅ Готово${NC}"
     sleep 2
     clear
@@ -722,6 +765,9 @@ install_process() {
         echo -e "  ${DIM}Попробуй позже: tguard update${NC}"
         sleep 3
     fi
+
+    echo ""
+    fix_ipv6_ufw
 
     mkdir -p /var/log
     touch /var/log/iptables-scanners-{ipv4,ipv6}.log
@@ -766,6 +812,7 @@ show_help() {
     echo -e "    ${GREEN}monitor${NC}         Открыть меню управления ${DIM}(по умолчанию)${NC}"
     echo -e "    ${GREEN}update${NC}          Обновить списки блокировок"
     echo -e "    ${GREEN}upgrade${NC}         Проверить и установить новую версию"
+    echo -e "    ${GREEN}fix-ipv6${NC}        Починить связь SCANNERS-BLOCK ↔ UFW IPv6"
     echo -e "    ${RED}uninstall${NC}       Удалить TGuard и все его файлы"
     echo -e "    ${DIM}-v, --version${NC}   Показать версию"
     echo -e "    ${DIM}-h, --help${NC}      Показать эту справку"
@@ -776,6 +823,7 @@ show_help() {
     echo ""
     echo -e "  ${BOLD}Примеры:${NC}"
     echo -e "    ${DIM}tguard upgrade${NC}                       ${DIM}# проверить обновление${NC}"
+    echo -e "    ${DIM}tguard fix-ipv6${NC}                      ${DIM}# починить IPv6 связь${NC}"
     echo -e "    ${DIM}tguard uninstall --yes --remove-logs${NC} ${DIM}# полная очистка${NC}"
     echo ""
     exit 0
@@ -823,6 +871,43 @@ upgrade_process() {
     fi
 }
 
+fix_ipv6_process() {
+    clear
+    echo -e "${CYAN}${BOLD}  🔧  ПОЧИНКА IPv6${NC}  ${DIM}· v${VERSION}${NC}"
+    echo -e "${DIM}  ──────────────────────────────────────────────${NC}\n"
+
+    if ! command -v ip6tables >/dev/null 2>&1; then
+        echo -e "  ${DIM}ip6tables не установлен — IPv6 не используется${NC}"
+        sleep 2
+        clear
+        return
+    fi
+
+    if ! ip6tables -L SCANNERS-BLOCK -n &>/dev/null; then
+        echo -e "  ${YELLOW}⚠ Цепочка SCANNERS-BLOCK (IPv6) не создана${NC}"
+        echo -e "  ${DIM}Сначала запусти: tguard install${NC}"
+        sleep 3
+        clear
+        return
+    fi
+
+    echo -e "  ${BLUE}▸ Проверка связи SCANNERS-BLOCK ↔ ufw6-before-input...${NC}"
+
+    if ip6tables -L ufw6-before-input -n 2>/dev/null | grep -q "SCANNERS-BLOCK"; then
+        echo -e "  ${GREEN}✓ Связь уже установлена${NC}"
+        sleep 2
+        clear
+        return
+    fi
+
+    fix_ipv6_ufw
+
+    echo ""
+    echo -e "  ${GREEN}✅ Готово${NC}"
+    sleep 2
+    clear
+}
+
 show_menu() {
     local new_ver
     if new_ver=$(check_for_updates); then
@@ -852,6 +937,7 @@ show_menu() {
         echo -e "  ${GREEN}5${NC}   🔄  Обновить списки     ${DIM}update${NC}"
         echo -e "  ${GREEN}6${NC}   🛠️   Переустановить      ${DIM}reinstall${NC}"
         echo -e "  ${GREEN}8${NC}   ⬆️   Обновить версию    ${DIM}upgrade${NC}"
+        echo -e "  ${GREEN}9${NC}   🔧  Починить IPv6      ${DIM}fix-ipv6${NC}"
         echo -e "  ${RED}7${NC}   🗑️   Удалить всё         ${DIM}uninstall${NC}"
         echo ""
         echo -e "  ${DIM}0${NC}   ❌  Выход"
@@ -887,6 +973,7 @@ show_menu() {
                 uninstall_process
                 ;;
             8) upgrade_process ;;
+            9) fix_ipv6_process ;;
             0)
                 clear
                 exit 0
@@ -906,6 +993,7 @@ case "${1:-}" in
     monitor)      show_menu ;;
     update)       update_lists ;;
     upgrade)      upgrade_process ;;
+    fix-ipv6)     fix_ipv6_process ;;
     uninstall)
         shift
         while [[ $# -gt 0 ]]; do

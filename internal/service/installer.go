@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -19,6 +20,14 @@ func NewInstallerService(logger zerolog.Logger) *InstallerService {
 	return &InstallerService{
 		logger: logger,
 	}
+}
+
+func (s *InstallerService) isIPv6Supported() bool {
+	data, err := os.ReadFile("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(data)) == "0"
 }
 
 func (s *InstallerService) EnsureDependencies() error {
@@ -37,14 +46,18 @@ func (s *InstallerService) EnsureDependencies() error {
 		s.logger.Debug().Msg("iptables уже установлен")
 	}
 
-	if !s.commandExists("ip6tables") {
-		s.logger.Info().Msg("Установка ip6tables")
-		if err := s.installPackage("ip6tables", distro); err != nil {
-			return fmt.Errorf("failed to install ip6tables: %w", err)
+	if s.isIPv6Supported() {
+		if !s.commandExists("ip6tables") {
+			s.logger.Info().Msg("Установка ip6tables")
+			if err := s.installPackage("ip6tables", distro); err != nil {
+				return fmt.Errorf("failed to install ip6tables: %w", err)
+			}
+			s.logger.Info().Msg("ip6tables установлен")
+		} else {
+			s.logger.Debug().Msg("ip6tables уже установлен")
 		}
-		s.logger.Info().Msg("ip6tables установлен")
 	} else {
-		s.logger.Debug().Msg("ip6tables уже установлен")
+		s.logger.Info().Msg("IPv6 отключён в системе — ip6tables не требуется")
 	}
 
 	if !s.commandExists("ipset") {

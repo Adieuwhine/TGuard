@@ -28,6 +28,14 @@ func NewIptablesService(logger zerolog.Logger, cmdSvc *CommandService, enableLog
 	}
 }
 
+func (s *IptablesService) isIPv6Supported() bool {
+	data, err := os.ReadFile("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(data)) == "0"
+}
+
 func (s *IptablesService) SetupChain() error {
 	s.logger.Info().Msg("Настройка цепочек iptables")
 
@@ -40,8 +48,12 @@ func (s *IptablesService) SetupChain() error {
 		return fmt.Errorf("failed to setup IPv4 chain: %w", err)
 	}
 
-	if err := s.setupVersionChain(IPv6, ipsetV6Name, linkToInput); err != nil {
-		return fmt.Errorf("failed to setup IPv6 chain: %w", err)
+	if s.isIPv6Supported() {
+		if err := s.setupVersionChain(IPv6, ipsetV6Name, linkToInput); err != nil {
+			s.logger.Warn().Err(err).Msg("Failed to setup IPv6 chain, continuing without IPv6")
+		}
+	} else {
+		s.logger.Info().Msg("IPv6 отключён — пропуск настройки SCANNERS-BLOCK-V6")
 	}
 
 	s.logger.Info().Msg("Цепочки iptables настроены")
@@ -129,6 +141,54 @@ func (s *IptablesService) Save() error {
 
 	s.logger.Info().Msg("Использование netfilter-persistent")
 	return s.saveWithNetfilterPersistent()
+}
+
+func (s *IptablesService) moveChainToPositionOne(version IPVersion, ufwChain string) {
+	cmd := "iptables"
+	label := "IPv4"
+	if version == IPv6 {
+		cmd = "ip6tables"
+		label = "IPv6"
+	}
+
+	if !s.cmdSvc.CommandExists(cmd) {
+		s.logger.Debug().Str("command", cmd).Msg("Command not found, skipping chain move")
+		return
+	}
+
+	if !s.iptablesCmd.ChainExists(version, TableFilter, ufwChain) {
+		s.logger.Debug().Str("chain", ufwChain).Msg("UFW input chain not found, skipping chain move")
+		return
+	}
+
+	if !s.iptablesCmd.ChainExists(version, TableFilter, chainName) {
+		s.logger.Debug().Str("chain", chainName).Msg("SCANNERS-BLOCK chain not found, skipping chain move")
+		return
+	}
+
+	ruleSpec := []string{"-j", chainName}
+	ruleExists := s.iptablesCmd.RuleExists(version, TableFilter, ufwChain, ruleSpec)
+
+	if ruleExists {
+		if err := s.cmdSvc.Run(cmd, "-D", ufwChain, "-j", chainName); err != nil {
+			s.logger.Warn().Err(err).
+				Str("version", label).
+				Str("chain", ufwChain).
+				Msg("Failed to remove existing rule, continuing")
+		}
+	}
+
+	if err := s.cmdSvc.Run(cmd, "-I", ufwChain, "1", "-j", chainName); err != nil {
+		s.logger.Warn().Err(err).
+			Str("version", label).
+			Str("chain", ufwChain).
+			Msg("Failed to insert rule at position 1")
+	} else {
+		s.logger.Info().
+			Str("version", label).
+			Str("chain", ufwChain).
+			Msg("SCANNERS-BLOCK moved to position 1")
+	}
 }
 
 func (s *IptablesService) removeManagedBlock(content, startMarker string) string {
@@ -304,7 +364,7 @@ func (s *IptablesService) saveWithUFW() error {
 	}
 	s.logger.Info().Msg("Обновлён UFW before.rules для IPv4")
 
-	if contentV6 != nil {
+	if contentV6 != nil && s.isIPv6Supported() {
 		contentV6Str := string(contentV6)
 		if strings.Contains(contentV6Str, markerV6) {
 			s.logger.Info().Msg("Обнаружен существующий блок SCANNERS-BLOCK в before6.rules, обновляем...")
@@ -359,6 +419,8 @@ func (s *IptablesService) saveWithUFW() error {
 				}
 			}
 		}
+	} else if contentV6 != nil && !s.isIPv6Supported() {
+		s.logger.Info().Msg("IPv6 отключён — пропуск настройки before6.rules")
 	}
 
 	if !wasActive {
@@ -377,25 +439,8 @@ func (s *IptablesService) saveWithUFW() error {
 
 	s.logger.Info().Msg("Перемещение SCANNERS-BLOCK на позицию 1 в ufw-before-input")
 
-	if err := s.cmdSvc.Run("iptables", "-D", "ufw-before-input", "-j", chainName); err != nil {
-		s.logger.Warn().Err(err).Msg("Не удалось удалить SCANNERS-BLOCK из ufw-before-input")
-	}
-
-	if err := s.cmdSvc.Run("iptables", "-I", "ufw-before-input", "1", "-j", chainName); err != nil {
-		s.logger.Warn().Err(err).Msg("Не удалось вставить SCANNERS-BLOCK на позицию 1 (IPv4)")
-	} else {
-		s.logger.Info().Msg("SCANNERS-BLOCK перемещён на позицию 1 в ufw-before-input (IPv4)")
-	}
-
-	if err := s.cmdSvc.Run("ip6tables", "-D", "ufw6-before-input", "-j", chainName); err != nil {
-		s.logger.Warn().Err(err).Msg("Не удалось удалить SCANNERS-BLOCK из ufw6-before-input")
-	}
-
-	if err := s.cmdSvc.Run("ip6tables", "-I", "ufw6-before-input", "1", "-j", chainName); err != nil {
-		s.logger.Warn().Err(err).Msg("Не удалось вставить SCANNERS-BLOCK на позицию 1 (IPv6)")
-	} else {
-		s.logger.Info().Msg("SCANNERS-BLOCK перемещён на позицию 1 в ufw6-before-input (IPv6)")
-	}
+	s.moveChainToPositionOne(IPv4, "ufw-before-input")
+	s.moveChainToPositionOne(IPv6, "ufw6-before-input")
 
 	if err := s.createMoveRuleService(); err != nil {
 		s.logger.Warn().Err(err).Msg("Не удалось создать systemd сервис для перемещения правил")
@@ -435,10 +480,13 @@ func (s *IptablesService) saveWithNetfilterPersistent() error {
 	}
 	s.logger.Info().Msg("Правила IPv4 сохранены в /etc/iptables/rules.v4")
 
-	if err := s.iptablesCmd.Save(IPv6, "/etc/iptables/rules.v6"); err != nil {
-		return fmt.Errorf("failed to save ip6tables: %w", err)
+	if s.isIPv6Supported() {
+		if err := s.iptablesCmd.Save(IPv6, "/etc/iptables/rules.v6"); err != nil {
+			s.logger.Warn().Err(err).Msg("Failed to save ip6tables, continuing")
+		} else {
+			s.logger.Info().Msg("Правила IPv6 сохранены в /etc/iptables/rules.v6")
+		}
 	}
-	s.logger.Info().Msg("Правила IPv6 сохранены в /etc/iptables/rules.v6")
 
 	if err := s.cmdSvc.Run("netfilter-persistent", "save"); err != nil {
 		s.logger.Warn().Err(err).Msg("netfilter-persistent save failed")

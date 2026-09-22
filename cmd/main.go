@@ -18,7 +18,7 @@ var (
 	confirmYes    bool
 	removeLogs    bool
 	logLevel      string
-	version       = "0.1"
+	version       = "0.2"
 )
 
 func main() {
