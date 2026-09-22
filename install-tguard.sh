@@ -158,18 +158,6 @@ cleanup_old_install() {
         ufw reload 2>/dev/null
     fi
 
-    local LOGFILE_CANDIDATES=(
-        "/var/log/iptables-scanners-ipv4.log"
-        "/var/log/iptables-scanners-ipv6.log"
-        "/var/log/iptables-scanners-aggregate.csv"
-    )
-    for f in "${LOGFILE_CANDIDATES[@]}"; do
-        if [[ -e "$f" ]]; then
-            FOUND+=("$f")
-            rm -f "$f"
-        fi
-    done
-
     if [[ -f /tmp/tguard ]]; then
         FOUND+=("/tmp/tguard")
         rm -f /tmp/tguard
@@ -345,9 +333,17 @@ uninstall_process() {
     echo -e "${RED}${BOLD}  🗑️   УДАЛЕНИЕ TGUARD${NC}  ${DIM}· v${VERSION}${NC}"
     echo -e "${DIM}  ──────────────────────────────────────────────${NC}\n"
 
+    if [ "$REMOVE_LOGS" = true ]; then
+        echo -e "  ${YELLOW}Будут удалены: бинарники, сервисы, правила, конфиги и логи${NC}"
+    else
+        echo -e "  ${YELLOW}Будут удалены: бинарники, сервисы, правила, конфиги${NC}"
+        echo -e "  ${DIM}Логи останутся в /var/log/${NC}"
+    fi
+    echo ""
+
     if [ "$FORCE_YES" != true ]; then
         trap 'clear; return' INT
-        read -p "  Удалить ВСЁ, что создал TGuard? (y/N): " confirm < /dev/tty || { clear; return; }
+        read -p "  Продолжить? (y/N): " confirm < /dev/tty || { clear; return; }
         trap - INT
 
         if [[ "$confirm" != "y" ]]; then
@@ -367,7 +363,7 @@ uninstall_process() {
         "${TG_BIN_PATH}" uninstall --yes 2>/dev/null || true
     fi
 
-    echo -e "\n  ${BLUE}▸ Удаление iptables правил...${NC}"
+    echo -e "  ${BLUE}▸ Удаление iptables правил...${NC}"
     while iptables -D INPUT -j SCANNERS-BLOCK 2>/dev/null; do :; done
     iptables -F SCANNERS-BLOCK 2>/dev/null
     iptables -X SCANNERS-BLOCK 2>/dev/null
@@ -442,9 +438,6 @@ uninstall_process() {
     systemctl restart rsyslog 2>/dev/null
 
     echo -e "\n  ${GREEN}✅ Всё удалено${NC}"
-    if [ "$REMOVE_LOGS" != true ]; then
-        echo -e "  ${DIM}Логи оставлены. Удалить: tguard uninstall --remove-logs${NC}"
-    fi
     sleep 2
     clear
 
@@ -662,8 +655,8 @@ show_help() {
     echo -e "    ${CYAN}--yes${NC}, ${CYAN}-y${NC}           Без подтверждения"
     echo ""
     echo -e "  ${BOLD}Примеры:${NC}"
-    echo -e "    ${DIM}tguard uninstall${NC}                    ${DIM}# с подтверждением${NC}"
-    echo -e "    ${DIM}tguard uninstall --yes${NC}              ${DIM}# без подтверждения${NC}"
+    echo -e "    ${DIM}tguard uninstall${NC}                     ${DIM}# с подтверждением, логи остаются${NC}"
+    echo -e "    ${DIM}tguard uninstall --yes${NC}               ${DIM}# без подтверждения${NC}"
     echo -e "    ${DIM}tguard uninstall --yes --remove-logs${NC} ${DIM}# полная очистка${NC}"
     echo ""
     exit 0
@@ -732,7 +725,11 @@ show_menu() {
                 rm -f /var/log/iptables-scanners-aggregate.csv
                 install_process
                 ;;
-            7) uninstall_process ;;
+            7)
+                REMOVE_LOGS=true
+                FORCE_YES=false
+                uninstall_process
+                ;;
             0)
                 clear
                 exit 0
