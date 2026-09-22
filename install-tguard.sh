@@ -79,7 +79,7 @@ cleanup_old_install() {
         "/sbin/tguard"
     )
     for f in "${BIN_CANDIDATES[@]}"; do
-        if [[ -e "$f" ]]; then
+        if [[ -e "$f" ]] && [[ "$f" != "/usr/local/bin/tguard" ]]; then
             FOUND+=("$f")
             rm -f "$f"
         fi
@@ -87,9 +87,7 @@ cleanup_old_install() {
 
     local SCRIPT_CANDIDATES=(
         "/usr/local/bin/antiscan-aggregate-logs.sh"
-        "/usr/local/bin/tguard"
         "/usr/bin/tguard"
-        "/opt/tguard-manager.sh"
     )
     for f in "${SCRIPT_CANDIDATES[@]}"; do
         if [[ -e "$f" ]]; then
@@ -376,13 +374,15 @@ uninstall_process() {
         ufw reload 2>/dev/null
     fi
 
-    rm -f /usr/local/bin/tguard /usr/bin/tguard /opt/tguard-manager.sh "$MANUAL_FILE"
+    rm -f /usr/local/bin/tguard /usr/bin/tguard "$MANUAL_FILE"
     rm -f "${TG_BIN_PATH}" "${TG_LINK_PATH}" /tmp/tguard
 
     systemctl restart rsyslog 2>/dev/null
     echo -e "\n  ${GREEN}✅ Удалено${NC}"
     sleep 2
     clear
+
+    (sleep 1 && rm -f /opt/tguard-manager.sh) &
     exit 0
 }
 
