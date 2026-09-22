@@ -36,6 +36,9 @@ LIST_GOV="https://raw.githubusercontent.com/${TG_REPO}/main/lists/gov.list"
 LIST_MISC="https://raw.githubusercontent.com/${TG_REPO}/main/lists/misc.list"
 MANUAL_FILE="/opt/tguard-manual.list"
 
+REMOVE_LOGS=false
+FORCE_YES=false
+
 check_root() {
     [[ $EUID -ne 0 ]] && { clear; echo -e "${RED}Запуск только от root!${NC}"; exit 1; }
 }
@@ -72,7 +75,6 @@ cleanup_old_install() {
 
     local BIN_CANDIDATES=(
         "/opt/tguard"
-        "/usr/local/bin/tguard"
         "/usr/bin/tguard"
         "/usr/local/sbin/tguard"
         "/bin/tguard"
@@ -343,42 +345,106 @@ uninstall_process() {
     echo -e "${RED}${BOLD}  🗑️   УДАЛЕНИЕ TGUARD${NC}  ${DIM}· v${VERSION}${NC}"
     echo -e "${DIM}  ──────────────────────────────────────────────${NC}\n"
 
-    trap 'clear; return' INT
-    read -p "  Вы уверены? (y/N): " confirm < /dev/tty || { clear; return; }
-    trap - INT
+    if [ "$FORCE_YES" != true ]; then
+        trap 'clear; return' INT
+        read -p "  Удалить ВСЁ, что создал TGuard? (y/N): " confirm < /dev/tty || { clear; return; }
+        trap - INT
 
-    if [[ "$confirm" != "y" ]]; then
-        clear
-        return
+        if [[ "$confirm" != "y" ]]; then
+            clear
+            return
+        fi
     fi
 
+    echo -e "  ${BLUE}▸ Остановка сервисов...${NC}"
+    systemctl stop antiscan-aggregate.timer 2>/dev/null
+    systemctl stop antiscan-aggregate.service 2>/dev/null
+    systemctl disable antiscan-aggregate.timer 2>/dev/null
+    systemctl disable antiscan-aggregate.service 2>/dev/null
+
     if [[ -x "${TG_BIN_PATH}" ]]; then
-        "${TG_BIN_PATH}" uninstall --yes
-    else
-        systemctl stop antiscan-aggregate.timer antiscan-aggregate.service 2>/dev/null
-        systemctl disable antiscan-aggregate.timer antiscan-aggregate.service 2>/dev/null
-        rm -f /usr/local/bin/antiscan-aggregate-logs.sh
-        rm -f /etc/systemd/system/antiscan-*
-        rm -f /etc/rsyslog.d/10-iptables-scanners.conf /etc/logrotate.d/iptables-scanners
+        echo -e "  ${BLUE}▸ Встроенное удаление tguard...${NC}"
+        "${TG_BIN_PATH}" uninstall --yes 2>/dev/null || true
+    fi
 
-        iptables -D INPUT -j SCANNERS-BLOCK 2>/dev/null
-        iptables -F SCANNERS-BLOCK 2>/dev/null
-        iptables -X SCANNERS-BLOCK 2>/dev/null
-        ipset flush SCANNERS-BLOCK-V4 2>/dev/null
-        ipset destroy SCANNERS-BLOCK-V4 2>/dev/null
-        ipset flush SCANNERS-BLOCK-V6 2>/dev/null
-        ipset destroy SCANNERS-BLOCK-V6 2>/dev/null
+    echo -e "\n  ${BLUE}▸ Удаление iptables правил...${NC}"
+    while iptables -D INPUT -j SCANNERS-BLOCK 2>/dev/null; do :; done
+    iptables -F SCANNERS-BLOCK 2>/dev/null
+    iptables -X SCANNERS-BLOCK 2>/dev/null
+    while ip6tables -D INPUT -j SCANNERS-BLOCK 2>/dev/null; do :; done
+    ip6tables -F SCANNERS-BLOCK 2>/dev/null
+    ip6tables -X SCANNERS-BLOCK 2>/dev/null
 
-        sed -i '/SCANNERS-BLOCK/d' /etc/ufw/before.rules 2>/dev/null
-        sed -i '/SCANNERS-BLOCK/d' /etc/ufw/before6.rules 2>/dev/null
+    echo -e "  ${BLUE}▸ Удаление ipset наборов...${NC}"
+    ipset flush SCANNERS-BLOCK-V4 2>/dev/null
+    ipset destroy SCANNERS-BLOCK-V4 2>/dev/null
+    ipset flush SCANNERS-BLOCK-V6 2>/dev/null
+    ipset destroy SCANNERS-BLOCK-V6 2>/dev/null
+
+    echo -e "  ${BLUE}▸ Очистка UFW...${NC}"
+    local UFW_CHANGED=false
+    for ufw_file in /etc/ufw/before.rules /etc/ufw/before6.rules; do
+        if [[ -f "$ufw_file" ]] && grep -q "SCANNERS-BLOCK" "$ufw_file" 2>/dev/null; then
+            sed -i '/SCANNERS-BLOCK/d' "$ufw_file"
+            UFW_CHANGED=true
+        fi
+    done
+    if [ "$UFW_CHANGED" = true ]; then
         ufw reload 2>/dev/null
     fi
 
-    rm -f /usr/local/bin/tguard /usr/bin/tguard "$MANUAL_FILE"
-    rm -f "${TG_BIN_PATH}" "${TG_LINK_PATH}" /tmp/tguard
+    echo -e "  ${BLUE}▸ Удаление systemd units...${NC}"
+    rm -f /etc/systemd/system/antiscan-aggregate.timer
+    rm -f /etc/systemd/system/antiscan-aggregate.service
+    rm -f /lib/systemd/system/antiscan-aggregate.timer
+    rm -f /lib/systemd/system/antiscan-aggregate.service
+    systemctl daemon-reload 2>/dev/null
+    systemctl reset-failed 2>/dev/null
 
+    echo -e "  ${BLUE}▸ Удаление конфигов rsyslog/logrotate...${NC}"
+    rm -f /etc/rsyslog.d/10-iptables-scanners.conf
+    rm -f /etc/logrotate.d/iptables-scanners
+
+    echo -e "  ${BLUE}▸ Удаление скриптов и бинарников...${NC}"
+    rm -f /usr/local/bin/antiscan-aggregate-logs.sh
+    rm -f /usr/local/bin/tguard
+    rm -f /usr/bin/tguard
+    rm -f /usr/local/sbin/tguard
+    rm -f /bin/tguard
+    rm -f /sbin/tguard
+    rm -f /opt/tguard
+    rm -f /opt/tguard-manual.list
+    rm -f /tmp/tguard
+
+    echo -e "  ${BLUE}▸ Удаление файлов ipset persistence...${NC}"
+    if [[ -f /etc/ipset.conf ]] && grep -q "SCANNERS-BLOCK" /etc/ipset.conf 2>/dev/null; then
+        sed -i '/SCANNERS-BLOCK/d' /etc/ipset.conf
+    fi
+
+    echo -e "  ${BLUE}▸ Удаление iptables persistence...${NC}"
+    for rules_file in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+        if [[ -f "$rules_file" ]] && grep -q "SCANNERS-BLOCK" "$rules_file" 2>/dev/null; then
+            sed -i '/SCANNERS-BLOCK/d' "$rules_file"
+        fi
+    done
+
+    if [ "$REMOVE_LOGS" = true ]; then
+        echo -e "  ${BLUE}▸ Удаление логов...${NC}"
+        rm -f /var/log/iptables-scanners-ipv4.log
+        rm -f /var/log/iptables-scanners-ipv6.log
+        rm -f /var/log/iptables-scanners-aggregate.csv
+        rm -f /var/log/iptables-scanners-ipv4.log.*
+        rm -f /var/log/iptables-scanners-ipv6.log.*
+        rm -f /var/log/iptables-scanners-aggregate.csv.*
+    fi
+
+    echo -e "  ${BLUE}▸ Перезапуск rsyslog...${NC}"
     systemctl restart rsyslog 2>/dev/null
-    echo -e "\n  ${GREEN}✅ Удалено${NC}"
+
+    echo -e "\n  ${GREEN}✅ Всё удалено${NC}"
+    if [ "$REMOVE_LOGS" != true ]; then
+        echo -e "  ${DIM}Логи оставлены. Удалить: tguard uninstall --remove-logs${NC}"
+    fi
     sleep 2
     clear
 
@@ -581,15 +647,24 @@ show_help() {
     echo -e "${CYAN}${BOLD}  🛡️   TGUARD${NC}  ${DIM}· v${VERSION}${NC}"
     echo -e "${DIM}  ──────────────────────────────────────────────${NC}"
     echo ""
-    echo -e "  ${BOLD}Использование:${NC}  tguard [команда]"
+    echo -e "  ${BOLD}Использование:${NC}  tguard [команда] [опции]"
     echo ""
     echo -e "  ${BOLD}Команды:${NC}"
     echo -e "    ${GREEN}install${NC}         Установить TGuard"
     echo -e "    ${GREEN}monitor${NC}         Открыть меню управления ${DIM}(по умолчанию)${NC}"
     echo -e "    ${GREEN}update${NC}          Обновить списки блокировок"
-    echo -e "    ${RED}uninstall${NC}       Удалить TGuard"
+    echo -e "    ${RED}uninstall${NC}       Удалить TGuard и все его файлы"
     echo -e "    ${DIM}-v, --version${NC}   Показать версию"
     echo -e "    ${DIM}-h, --help${NC}      Показать эту справку"
+    echo ""
+    echo -e "  ${BOLD}Опции uninstall:${NC}"
+    echo -e "    ${CYAN}--remove-logs${NC}, ${CYAN}-r${NC}   Удалить логи из /var/log"
+    echo -e "    ${CYAN}--yes${NC}, ${CYAN}-y${NC}           Без подтверждения"
+    echo ""
+    echo -e "  ${BOLD}Примеры:${NC}"
+    echo -e "    ${DIM}tguard uninstall${NC}                    ${DIM}# с подтверждением${NC}"
+    echo -e "    ${DIM}tguard uninstall --yes${NC}              ${DIM}# без подтверждения${NC}"
+    echo -e "    ${DIM}tguard uninstall --yes --remove-logs${NC} ${DIM}# полная очистка${NC}"
     echo ""
     exit 0
 }
@@ -628,7 +703,7 @@ show_menu() {
         echo -e "  ${GREEN}4${NC}   🧪  Управление IP        ${DIM}ban / unban${NC}"
         echo -e "  ${GREEN}5${NC}   🔄  Обновить списки     ${DIM}update${NC}"
         echo -e "  ${GREEN}6${NC}   🛠️   Переустановить      ${DIM}reinstall${NC}"
-        echo -e "  ${RED}7${NC}   🗑️   Удалить             ${DIM}uninstall${NC}"
+        echo -e "  ${RED}7${NC}   🗑️   Удалить всё         ${DIM}uninstall${NC}"
         echo ""
         echo -e "  ${DIM}0${NC}   ❌  Выход"
         echo ""
@@ -668,11 +743,25 @@ show_menu() {
 }
 
 check_root
+
+REMOVE_LOGS=false
+FORCE_YES=false
+
 case "${1:-}" in
     install)      install_process ;;
     monitor)      show_menu ;;
     update)       update_lists ;;
-    uninstall)    uninstall_process ;;
+    uninstall)
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --remove-logs|-r) REMOVE_LOGS=true ;;
+                --yes|-y)         FORCE_YES=true ;;
+            esac
+            shift
+        done
+        uninstall_process
+        ;;
     -v|--version) show_version ;;
     -h|--help)    show_help ;;
     *)            show_menu ;;
