@@ -120,15 +120,37 @@ check_for_updates() {
 
     latest="${latest#v}"
 
-    if [ "$latest" != "$VERSION" ]; then
-        local latest_num version_num
-        latest_num=$(echo "$latest" | tr -d '.')
-        version_num=$(echo "$VERSION" | tr -d '.')
-        if [ "$latest_num" -gt "$version_num" ] 2>/dev/null; then
+    local installed=""
+    for f in /opt/tguard-v*; do
+        [[ -e "$f" ]] || continue
+        local v="${f##*/tguard-v}"
+        if [[ -z "$installed" ]] || [[ "$v" > "$installed" ]]; then
+            installed="$v"
+        fi
+    done
+
+    [[ -z "$installed" ]] && { echo "$latest"; return 0; }
+    [ "$latest" = "$installed" ] && return 1
+
+    local IFS='.'
+    local -a L=($latest) I=($installed)
+    unset IFS
+
+    local i max
+    max=${#L[@]}
+    [ ${#I[@]} -gt $max ] && max=${#I[@]}
+
+    for ((i=0; i<max; i++)); do
+        local lv="${L[i]:-0}"
+        local iv="${I[i]:-0}"
+        if [ "$lv" -gt "$iv" ] 2>/dev/null; then
             echo "$latest"
             return 0
+        elif [ "$lv" -lt "$iv" ] 2>/dev/null; then
+            return 1
         fi
-    fi
+    done
+
     return 1
 }
 
