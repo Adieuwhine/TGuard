@@ -1,0 +1,689 @@
+#!/bin/bash
+
+MANAGER_PATH="/opt/tguard-manager.sh"
+LINK_PATH="/usr/local/bin/tguard"
+MANUAL_FILE="/opt/tguard-manual.list"
+
+rm -f "$MANAGER_PATH" "$LINK_PATH"
+
+cat > "$MANAGER_PATH" << 'EOF'
+#!/bin/bash
+set -u
+
+VERSION="0.1"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+TG_REPO="Adieuwhine/TGuard"
+TG_BINARY="tguard"
+TG_INSTALL_DIR="/opt"
+TG_BIN_PATH="${TG_INSTALL_DIR}/${TG_BINARY}"
+TG_LINK_DIR="/usr/local/bin"
+TG_LINK_PATH="${TG_LINK_DIR}/${TG_BINARY}"
+TG_LATEST_URL="https://github.com/${TG_REPO}/releases/latest/download"
+TG_DEV_MODE=false
+
+LIST_ANTISCAN="https://raw.githubusercontent.com/${TG_REPO}/main/lists/antiscan.list"
+LIST_GOV="https://raw.githubusercontent.com/${TG_REPO}/main/lists/gov.list"
+LIST_MISC="https://raw.githubusercontent.com/${TG_REPO}/main/lists/misc.list"
+MANUAL_FILE="/opt/tguard-manual.list"
+
+check_root() {
+    [[ $EUID -ne 0 ]] && { clear; echo -e "${RED}Запуск только от root!${NC}"; exit 1; }
+}
+
+check_firewall_safety() {
+    echo -e "${BLUE}▸ Проверка конфигурации Firewall...${NC}"
+    if command -v ufw >/dev/null; then
+        UFW_STATUS=$(ufw status | grep "Status" | awk '{print $2}')
+        UFW_RULES=$(ufw show added 2>/dev/null)
+        if [[ "$UFW_STATUS" == "inactive" ]]; then
+            if [[ "$UFW_RULES" != *"22"* ]] && [[ "$UFW_RULES" != *"SSH"* ]] && [[ "$UFW_RULES" != *"OpenSSH"* ]]; then
+                echo -e "\n${RED}⛔ АВАРИЙНАЯ ОСТАНОВКА!${NC}"
+                echo -e "${YELLOW}UFW выключен и нет правил SSH.${NC}"
+                echo "Выполните: ufw allow ssh"
+                sleep 3
+                clear
+                exit 1
+            fi
+        fi
+        echo -e "  ${GREEN}✓${NC} UFW: ${DIM}${UFW_STATUS:-unknown}${NC}"
+    else
+        echo -e "  ${DIM}UFW не установлен — используется iptables${NC}"
+        if ! dpkg -l | grep -q netfilter-persistent; then
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent netfilter-persistent
+        fi
+    fi
+}
+
+cleanup_old_install() {
+    echo -e "  ${BLUE}▸ Поиск остатков старой установки...${NC}"
+
+    local FOUND=()
+
+    local BIN_CANDIDATES=(
+        "/opt/tguard"
+        "/usr/local/bin/tguard"
+        "/usr/bin/tguard"
+        "/usr/local/sbin/tguard"
+        "/bin/tguard"
+        "/sbin/tguard"
+    )
+    for f in "${BIN_CANDIDATES[@]}"; do
+        if [[ -e "$f" ]]; then
+            FOUND+=("$f")
+            rm -f "$f"
+        fi
+    done
+
+    local SCRIPT_CANDIDATES=(
+        "/usr/local/bin/antiscan-aggregate-logs.sh"
+        "/usr/local/bin/tguard"
+        "/usr/bin/tguard"
+        "/opt/tguard-manager.sh"
+    )
+    for f in "${SCRIPT_CANDIDATES[@]}"; do
+        if [[ -e "$f" ]]; then
+            FOUND+=("$f")
+            rm -f "$f"
+        fi
+    done
+
+    local UNIT_CANDIDATES=(
+        "/etc/systemd/system/antiscan-aggregate.timer"
+        "/etc/systemd/system/antiscan-aggregate.service"
+        "/lib/systemd/system/antiscan-aggregate.timer"
+        "/lib/systemd/system/antiscan-aggregate.service"
+    )
+    for f in "${UNIT_CANDIDATES[@]}"; do
+        if [[ -e "$f" ]]; then
+            FOUND+=("$f")
+            systemctl stop "$(basename "$f")" 2>/dev/null
+            systemctl disable "$(basename "$f")" 2>/dev/null
+            rm -f "$f"
+        fi
+    done
+    systemctl daemon-reload 2>/dev/null
+
+    local LOG_CANDIDATES=(
+        "/etc/rsyslog.d/10-iptables-scanners.conf"
+        "/etc/logrotate.d/iptables-scanners"
+    )
+    for f in "${LOG_CANDIDATES[@]}"; do
+        if [[ -e "$f" ]]; then
+            FOUND+=("$f")
+            rm -f "$f"
+        fi
+    done
+
+    if iptables -L SCANNERS-BLOCK -n &>/dev/null; then
+        FOUND+=("iptables:SCANNERS-BLOCK")
+        iptables -D INPUT -j SCANNERS-BLOCK 2>/dev/null
+        iptables -F SCANNERS-BLOCK 2>/dev/null
+        iptables -X SCANNERS-BLOCK 2>/dev/null
+    fi
+
+    if ipset list SCANNERS-BLOCK-V4 &>/dev/null; then
+        FOUND+=("ipset:SCANNERS-BLOCK-V4")
+        ipset flush SCANNERS-BLOCK-V4 2>/dev/null
+        ipset destroy SCANNERS-BLOCK-V4 2>/dev/null
+    fi
+    if ipset list SCANNERS-BLOCK-V6 &>/dev/null; then
+        FOUND+=("ipset:SCANNERS-BLOCK-V6")
+        ipset flush SCANNERS-BLOCK-V6 2>/dev/null
+        ipset destroy SCANNERS-BLOCK-V6 2>/dev/null
+    fi
+
+    local UFW_CHANGED=false
+    if [[ -f /etc/ufw/before.rules ]] && grep -q "SCANNERS-BLOCK" /etc/ufw/before.rules 2>/dev/null; then
+        sed -i '/SCANNERS-BLOCK/d' /etc/ufw/before.rules
+        UFW_CHANGED=true
+        FOUND+=("ufw:before.rules")
+    fi
+    if [[ -f /etc/ufw/before6.rules ]] && grep -q "SCANNERS-BLOCK" /etc/ufw/before6.rules 2>/dev/null; then
+        sed -i '/SCANNERS-BLOCK/d' /etc/ufw/before6.rules
+        UFW_CHANGED=true
+        FOUND+=("ufw:before6.rules")
+    fi
+    if [ "$UFW_CHANGED" = true ]; then
+        ufw reload 2>/dev/null
+    fi
+
+    local LOGFILE_CANDIDATES=(
+        "/var/log/iptables-scanners-ipv4.log"
+        "/var/log/iptables-scanners-ipv6.log"
+        "/var/log/iptables-scanners-aggregate.csv"
+    )
+    for f in "${LOGFILE_CANDIDATES[@]}"; do
+        if [[ -e "$f" ]]; then
+            FOUND+=("$f")
+            rm -f "$f"
+        fi
+    done
+
+    if [[ -f /tmp/tguard ]]; then
+        FOUND+=("/tmp/tguard")
+        rm -f /tmp/tguard
+    fi
+
+    if [ ${#FOUND[@]} -eq 0 ]; then
+        echo -e "  ${GREEN}✓${NC} Остатков не найдено — чистая система"
+    else
+        echo -e "  ${YELLOW}Найдено и удалено ${#FOUND[@]} объектов:${NC}"
+        for item in "${FOUND[@]}"; do
+            echo -e "    ${DIM}·${NC} $item"
+        done
+    fi
+
+    systemctl restart rsyslog 2>/dev/null
+}
+
+detect_system() {
+    local os="" arch=""
+
+    case "$(uname -s)" in
+        Linux*) os="linux" ;;
+        *)
+            echo -e "${RED}❌ Неподдерживаемая ОС: $(uname -s)${NC}"
+            return 1
+            ;;
+    esac
+
+    case "$(uname -m)" in
+        x86_64|amd64)  arch="amd64" ;;
+        i386|i686)     arch="386" ;;
+        armv7l|armv6l) arch="arm" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *)
+            echo -e "${RED}❌ Неподдерживаемая архитектура: $(uname -m)${NC}"
+            return 1
+            ;;
+    esac
+
+    echo "${os}-${arch}"
+}
+
+get_latest_release_tag() {
+    local api_url="https://api.github.com/repos/${TG_REPO}/releases"
+    local tag=""
+
+    if [ "$TG_DEV_MODE" = true ]; then
+        api_url="${api_url}?per_page=1"
+    else
+        api_url="${api_url}/latest"
+    fi
+
+    if command -v curl &> /dev/null; then
+        tag=$(curl -fsSL "${api_url}" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/"tag_name": *"\(.*\)"/\1/')
+    elif command -v wget &> /dev/null; then
+        tag=$(wget -qO- "${api_url}" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/"tag_name": *"\(.*\)"/\1/')
+    else
+        echo -e "${RED}❌ Не найден curl или wget${NC}"
+        return 1
+    fi
+
+    [[ -z "$tag" ]] && return 1
+    echo "$tag"
+}
+
+download_binary() {
+    local platform=$1
+    local temp_file="/tmp/${TG_BINARY}"
+    local download_url=""
+
+    if [ "$TG_DEV_MODE" = true ]; then
+        local tag
+        tag=$(get_latest_release_tag) || return 1
+        echo -e "  ${DIM}Найден релиз:${NC} ${YELLOW}${tag}${NC}" >&2
+        download_url="https://github.com/${TG_REPO}/releases/download/${tag}/${TG_BINARY}-${platform}"
+    else
+        download_url="${TG_LATEST_URL}/${TG_BINARY}-${platform}"
+    fi
+
+    echo -e "  ${DIM}URL:${NC} ${download_url}" >&2
+
+    if command -v curl &> /dev/null; then
+        curl -fsSL "${download_url}" -o "${temp_file}" || return 1
+    elif command -v wget &> /dev/null; then
+        wget -q "${download_url}" -O "${temp_file}" || return 1
+    else
+        echo -e "${RED}❌ Не найден curl или wget${NC}"
+        return 1
+    fi
+
+    echo "${temp_file}"
+}
+
+install_binary() {
+    local temp_file=$1
+
+    mkdir -p "${TG_INSTALL_DIR}"
+    cp "${temp_file}" "${TG_BIN_PATH}"
+    chmod +x "${TG_BIN_PATH}"
+    rm -f "${temp_file}"
+
+    mkdir -p "${TG_LINK_DIR}"
+    ln -sf "${TG_BIN_PATH}" "${TG_LINK_PATH}"
+}
+
+tg_install() {
+    echo -e "  ${BLUE}▸ Определение системы...${NC}"
+
+    local platform
+    platform=$(detect_system) || return 1
+    echo -e "  ${DIM}Платформа:${NC} ${YELLOW}${platform}${NC}"
+
+    echo -e "  ${BLUE}▸ Скачивание бинарника...${NC}"
+    local temp_file
+    temp_file=$(download_binary "${platform}") || {
+        echo -e "\n  ${RED}❌ Ошибка скачивания бинарника${NC}"
+        return 1
+    }
+
+    echo -e "  ${BLUE}▸ Установка в ${TG_BIN_PATH}...${NC}"
+    install_binary "${temp_file}" || {
+        echo -e "\n  ${RED}❌ Ошибка установки${NC}"
+        return 1
+    }
+    echo -e "  ${DIM}Симлинк:${NC} ${TG_LINK_PATH} → ${TG_BIN_PATH}"
+
+    if [[ -x "${TG_BIN_PATH}" ]]; then
+        local ver
+        ver=$("${TG_BIN_PATH}" --version 2>&1 | head -n1)
+        echo -e "  ${GREEN}✅ ${TG_BINARY} установлен${NC}  ${DIM}${ver}${NC}"
+        return 0
+    else
+        echo -e "\n  ${RED}❌ Проверка установки не удалась${NC}"
+        return 1
+    fi
+}
+
+install_packages() {
+    local PKGS=(curl wget rsyslog ipset ufw grep sed coreutils whois)
+
+    echo -e "  ${BLUE}▸ Проверка и установка пакетов...${NC}"
+    echo -e "  ${DIM}Список:${NC} ${DIM}${PKGS[*]}${NC}"
+    echo ""
+
+    local MISSING=()
+    for pkg in "${PKGS[@]}"; do
+        if dpkg -s "$pkg" &>/dev/null; then
+            echo -e "  ${GREEN}✓${NC}  ${DIM}${pkg}${NC}"
+        else
+            echo -e "  ${CYAN}↓${NC}  ${pkg}  ${DIM}(будет установлен)${NC}"
+            MISSING+=("$pkg")
+        fi
+    done
+    echo ""
+
+    if [ ${#MISSING[@]} -eq 0 ]; then
+        echo -e "  ${GREEN}✅ Все пакеты уже установлены${NC}"
+    else
+        echo -e "  ${DIM}Обновление индексов apt...${NC}"
+        apt-get update -q
+
+        echo -e "\n  ${DIM}Установка ${#MISSING[@]} пакет(ов)...${NC}"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${MISSING[@]}"
+
+        echo -e "\n  ${GREEN}✅ Установлено:${NC} ${MISSING[*]}"
+    fi
+
+    systemctl enable --now rsyslog >/dev/null 2>&1
+}
+
+uninstall_process() {
+    clear
+    echo -e "${RED}${BOLD}  🗑️   УДАЛЕНИЕ TGUARD${NC}  ${DIM}· v${VERSION}${NC}"
+    echo -e "${DIM}  ──────────────────────────────────────────────${NC}\n"
+
+    trap 'clear; return' INT
+    read -p "  Вы уверены? (y/N): " confirm < /dev/tty || { clear; return; }
+    trap - INT
+
+    if [[ "$confirm" != "y" ]]; then
+        clear
+        return
+    fi
+
+    if [[ -x "${TG_BIN_PATH}" ]]; then
+        "${TG_BIN_PATH}" uninstall --yes
+    else
+        systemctl stop antiscan-aggregate.timer antiscan-aggregate.service 2>/dev/null
+        systemctl disable antiscan-aggregate.timer antiscan-aggregate.service 2>/dev/null
+        rm -f /usr/local/bin/antiscan-aggregate-logs.sh
+        rm -f /etc/systemd/system/antiscan-*
+        rm -f /etc/rsyslog.d/10-iptables-scanners.conf /etc/logrotate.d/iptables-scanners
+
+        iptables -D INPUT -j SCANNERS-BLOCK 2>/dev/null
+        iptables -F SCANNERS-BLOCK 2>/dev/null
+        iptables -X SCANNERS-BLOCK 2>/dev/null
+        ipset flush SCANNERS-BLOCK-V4 2>/dev/null
+        ipset destroy SCANNERS-BLOCK-V4 2>/dev/null
+        ipset flush SCANNERS-BLOCK-V6 2>/dev/null
+        ipset destroy SCANNERS-BLOCK-V6 2>/dev/null
+
+        sed -i '/SCANNERS-BLOCK/d' /etc/ufw/before.rules 2>/dev/null
+        sed -i '/SCANNERS-BLOCK/d' /etc/ufw/before6.rules 2>/dev/null
+        ufw reload 2>/dev/null
+    fi
+
+    rm -f /usr/local/bin/tguard /usr/bin/tguard /opt/tguard-manager.sh "$MANUAL_FILE"
+    rm -f "${TG_BIN_PATH}" "${TG_LINK_PATH}" /tmp/tguard
+
+    systemctl restart rsyslog 2>/dev/null
+    echo -e "\n  ${GREEN}✅ Удалено${NC}"
+    sleep 2
+    clear
+    exit 0
+}
+
+manage_test_ip() {
+    touch "$MANUAL_FILE"
+
+    while true; do
+        clear
+        echo -e "${MAGENTA}${BOLD}  🧪  УПРАВЛЕНИЕ IP${NC}  ${DIM}· v${VERSION}${NC}"
+        echo -e "${DIM}  ──────────────────────────────────────────────${NC}"
+        echo ""
+        echo -e "  ${RED}1${NC}   ⛔  Забанить IP"
+        echo -e "  ${GREEN}2${NC}   ✅  Разбанить IP"
+        echo ""
+        echo -e "  ${DIM}0${NC}   ↩️   Назад"
+        echo ""
+        echo -ne "  ${CYAN}👉  Действие:${NC} "
+
+        trap 'clear; return' INT
+        read -r action < /dev/tty || { clear; return; }
+        trap - INT
+
+        case $action in
+            1)
+                clear
+                echo -e "${MAGENTA}${BOLD}  🧪  УПРАВЛЕНИЕ IP${NC}  ${DIM}· v${VERSION}${NC}"
+                echo -e "${DIM}  ──────────────────────────────────────────────${NC}\n"
+                echo -e "  ${YELLOW}Введите IP для блокировки (Ctrl+C = отмена):${NC}"
+                echo -ne "  ${CYAN}IP:${NC} "
+
+                trap 'clear; continue 2' INT
+                read -r ip < /dev/tty || { clear; continue; }
+                trap - INT
+
+                [[ -z "$ip" ]] && continue
+
+                OUTPUT=$(ipset add SCANNERS-BLOCK-V4 "$ip" 2>&1)
+                if [ $? -eq 0 ]; then
+                    echo -e "  ${GREEN}✅ IP $ip заблокирован${NC}"
+                    if ! grep -Fxq "$ip" "$MANUAL_FILE"; then
+                        echo "$ip" >> "$MANUAL_FILE"
+                    fi
+                else
+                    echo -e "  ${RED}❌ Ошибка:${NC} $OUTPUT"
+                fi
+                read -p "  [Enter]..." < /dev/tty
+                ;;
+            2)
+                clear
+                echo -e "${MAGENTA}${BOLD}  🧪  УПРАВЛЕНИЕ IP${NC}  ${DIM}· v${VERSION}${NC}"
+                echo -e "${DIM}  ──────────────────────────────────────────────${NC}"
+                echo -e "\n  ${GREEN}${BOLD}Список ручных банов${NC}"
+                echo -e "${DIM}  ──────────────────────────────────────────────${NC}"
+
+                if [ ! -s "$MANUAL_FILE" ]; then
+                    echo -e "  ${DIM}Список пуст${NC}"
+                    read -p "  [Enter]..." < /dev/tty
+                    continue
+                fi
+
+                mapfile -t MANUAL_IPS < "$MANUAL_FILE"
+                i=1
+                for ip in "${MANUAL_IPS[@]}"; do
+                    printf "  ${CYAN}%2d)${NC}  %s\n" "$i" "$ip"
+                    ((i++))
+                done
+
+                echo ""
+                echo -e "  ${YELLOW}Введите номер из списка или IP вручную:${NC}"
+                echo -ne "  ${CYAN}Выбор:${NC} "
+
+                trap 'clear; continue 2' INT
+                read -r input < /dev/tty || { clear; continue; }
+                trap - INT
+
+                [[ -z "$input" ]] && continue
+
+                TARGET_IP=""
+                if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -le "${#MANUAL_IPS[@]}" ] && [ "$input" -gt 0 ]; then
+                    TARGET_IP="${MANUAL_IPS[$((input-1))]}"
+                else
+                    TARGET_IP="$input"
+                fi
+
+                echo -e "  ${DIM}Разбаниваем:${NC} ${YELLOW}$TARGET_IP${NC}"
+
+                OUTPUT=$(ipset del SCANNERS-BLOCK-V4 "$TARGET_IP" 2>&1)
+                sed -i "/^$TARGET_IP$/d" "$MANUAL_FILE"
+
+                if [ $? -eq 0 ]; then
+                    echo -e "  ${GREEN}✅ Разбанен${NC}"
+                else
+                    echo -e "  ${RED}⚠️  $OUTPUT${NC} (удалён из списка)"
+                fi
+                read -p "  [Enter]..." < /dev/tty
+                ;;
+            0)
+                clear
+                return
+                ;;
+        esac
+    done
+}
+
+update_lists() {
+    clear
+    echo -e "${CYAN}${BOLD}  🔄  ОБНОВЛЕНИЕ СПИСКОВ${NC}  ${DIM}· v${VERSION}${NC}"
+    echo -e "${DIM}  ──────────────────────────────────────────────${NC}\n"
+
+    local FAIL=0
+    for url in "$LIST_ANTISCAN" "$LIST_GOV" "$LIST_MISC"; do
+        printf "  ${DIM}·${NC} %s\n" "$url"
+        if curl -fsI "$url" >/dev/null 2>&1; then
+            echo -e "    ${GREEN}✓ доступен${NC}"
+        else
+            echo -e "    ${RED}✗ недоступен${NC}"
+            FAIL=1
+        fi
+    done
+
+    if [ $FAIL -ne 0 ]; then
+        echo -e "\n  ${RED}❌ Часть списков недоступна${NC}"
+        read -p "  [Enter]..." < /dev/tty
+        clear
+        return 1
+    fi
+
+    echo -e "\n  ${BLUE}▸ Применение...${NC}"
+    "${TG_BIN_PATH}" full -u "$LIST_ANTISCAN" -u "$LIST_GOV" -u "$LIST_MISC" --enable-logging
+    echo -e "\n  ${GREEN}✅ Готово${NC}"
+    sleep 2
+    clear
+}
+
+install_process() {
+    clear
+    echo -e "${CYAN}${BOLD}  🚀  УСТАНОВКА TGUARD${NC}  ${DIM}· v${VERSION}${NC}"
+    echo -e "${DIM}  ──────────────────────────────────────────────${NC}\n"
+
+    cleanup_old_install
+
+    echo ""
+    check_firewall_safety
+
+    echo ""
+    install_packages
+
+    echo -e "\n  ${BLUE}▸ Установка tguard...${NC}"
+    if ! tg_install; then
+        echo -e "\n  ${RED}❌ ОШИБКА УСТАНОВКИ!${NC}"
+        sleep 3
+        clear
+        exit 1
+    fi
+
+    echo -e "\n  ${BLUE}▸ Настройка правил...${NC}"
+    if ! "${TG_BIN_PATH}" full -u "$LIST_ANTISCAN" -u "$LIST_GOV" -u "$LIST_MISC" --enable-logging; then
+        echo -e "\n  ${YELLOW}⚠️  Не удалось применить списки${NC}"
+        echo -e "  ${DIM}Попробуй позже: tguard update${NC}"
+        sleep 3
+    fi
+
+    mkdir -p /var/log
+    touch /var/log/iptables-scanners-{ipv4,ipv6}.log
+    LOG_GROUP="syslog"
+    getent group adm >/dev/null && LOG_GROUP="adm"
+    chown syslog:$LOG_GROUP /var/log/iptables-scanners-*.log
+    chmod 640 /var/log/iptables-scanners-*.log
+
+    touch "$MANUAL_FILE"
+
+    systemctl restart rsyslog >/dev/null 2>&1
+    systemctl restart antiscan-aggregate.service 2>/dev/null || true
+    systemctl restart antiscan-aggregate.timer >/dev/null 2>&1
+
+    echo -e "\n  ${GREEN}✅ Установка завершена${NC}"
+    sleep 2
+    clear
+}
+
+view_log() {
+    local file=$1
+    clear
+    echo -e "${YELLOW}${BOLD}  🕵   LIVE LOG${NC}  ${DIM}· v${VERSION}${NC}"
+    echo -e "${DIM}  ──────────────────────────────────────────────${NC}"
+    echo -e "  ${DIM}Ctrl+C — назад в меню${NC}\n"
+
+    trap 'clear; return' INT
+    tail -f "$file"
+    trap - INT
+    clear
+}
+
+show_help() {
+    clear
+    echo -e "${CYAN}${BOLD}  🛡️   TGUARD${NC}  ${DIM}· v${VERSION}${NC}"
+    echo -e "${DIM}  ──────────────────────────────────────────────${NC}"
+    echo ""
+    echo -e "  ${BOLD}Использование:${NC}  tguard [команда]"
+    echo ""
+    echo -e "  ${BOLD}Команды:${NC}"
+    echo -e "    ${GREEN}install${NC}         Установить TGuard"
+    echo -e "    ${GREEN}monitor${NC}         Открыть меню управления ${DIM}(по умолчанию)${NC}"
+    echo -e "    ${GREEN}update${NC}          Обновить списки блокировок"
+    echo -e "    ${RED}uninstall${NC}       Удалить TGuard"
+    echo -e "    ${DIM}-v, --version${NC}   Показать версию"
+    echo -e "    ${DIM}-h, --help${NC}      Показать эту справку"
+    echo ""
+    exit 0
+}
+
+show_version() {
+    clear
+    echo -e "${CYAN}${BOLD}  🛡️   TGUARD${NC}  ${DIM}· v${VERSION}${NC}"
+    echo -e "${DIM}  ──────────────────────────────────────────────${NC}"
+    echo ""
+    echo -e "  ${BOLD}TGuard Manager${NC}  ${DIM}версия${NC} ${MAGENTA}${BOLD}v${VERSION}${NC}"
+    echo -e "  ${DIM}Firewall manager для защиты от сканеров и атак${NC}"
+    echo ""
+    exit 0
+}
+
+show_menu() {
+    while true; do
+        clear
+
+        IPSET_CNT=$(ipset list SCANNERS-BLOCK-V4 2>/dev/null | grep "Number of entries" | awk '{print $4}')
+        [[ -z "$IPSET_CNT" ]] && IPSET_CNT="0"
+        PKTS_CNT=$(iptables -vnL SCANNERS-BLOCK 2>/dev/null | grep "LOG" | awk '{print $1}')
+        [[ -z "$PKTS_CNT" ]] && PKTS_CNT="0"
+
+        echo ""
+        echo -e "  ${CYAN}${BOLD}🛡️   TGUARD${NC}  ${DIM}· v${VERSION}${NC}"
+        echo -e "${DIM}  ──────────────────────────────────────────────${NC}"
+        printf "  ${DIM}📊${NC}  Подсетей      ${GREEN}${BOLD}%8s${NC}\n" "$IPSET_CNT"
+        printf "  ${DIM}🔥${NC}  Атак отбито   ${RED}${BOLD}%8s${NC}\n" "$PKTS_CNT"
+        echo -e "${DIM}  ──────────────────────────────────────────────${NC}"
+        echo ""
+
+        echo -e "  ${GREEN}1${NC}   📈  Топ атак            ${DIM}CSV${NC}"
+        echo -e "  ${GREEN}2${NC}   🕵   Логи IPv4           ${DIM}live${NC}"
+        echo -e "  ${GREEN}3${NC}   🕵   Логи IPv6           ${DIM}live${NC}"
+        echo -e "  ${GREEN}4${NC}   🧪  Управление IP        ${DIM}ban / unban${NC}"
+        echo -e "  ${GREEN}5${NC}   🔄  Обновить списки     ${DIM}update${NC}"
+        echo -e "  ${GREEN}6${NC}   🛠️   Переустановить      ${DIM}reinstall${NC}"
+        echo -e "  ${RED}7${NC}   🗑️   Удалить             ${DIM}uninstall${NC}"
+        echo ""
+        echo -e "  ${DIM}0${NC}   ❌  Выход"
+        echo ""
+
+        echo -ne "  ${CYAN}👉  Ваш выбор:${NC} "
+
+        trap 'clear; exit 0' INT
+        read -r choice < /dev/tty || { clear; exit 0; }
+        trap - INT
+
+        case $choice in
+            1)
+                clear
+                echo -e "${GREEN}${BOLD}  📈  ТОП 20${NC}  ${DIM}· v${VERSION}${NC}"
+                echo -e "${DIM}  ──────────────────────────────────────────────${NC}\n"
+                [ -f /var/log/iptables-scanners-aggregate.csv ] && \
+                    tail -20 /var/log/iptables-scanners-aggregate.csv || \
+                    echo -e "  ${DIM}Нет данных${NC}"
+                read -p $'\n  [Enter] назад...' < /dev/tty
+                ;;
+            2) view_log "/var/log/iptables-scanners-ipv4.log" ;;
+            3) view_log "/var/log/iptables-scanners-ipv6.log" ;;
+            4) manage_test_ip ;;
+            5) update_lists ;;
+            6)
+                rm -f /var/log/iptables-scanners-aggregate.csv
+                install_process
+                ;;
+            7) uninstall_process ;;
+            0)
+                clear
+                exit 0
+                ;;
+            *) echo -e "  ${RED}Неверно${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+check_root
+case "${1:-}" in
+    install)      install_process ;;
+    monitor)      show_menu ;;
+    update)       update_lists ;;
+    uninstall)    uninstall_process ;;
+    -v|--version) show_version ;;
+    -h|--help)    show_help ;;
+    *)            show_menu ;;
+esac
+EOF
+
+chmod +x "$MANAGER_PATH"
+ln -s "$MANAGER_PATH" "$LINK_PATH"
+
+if [[ ! -x /opt/tguard ]]; then
+    /opt/tguard-manager.sh install
+fi
+
+/opt/tguard-manager.sh monitor
