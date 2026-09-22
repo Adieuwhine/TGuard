@@ -26,6 +26,7 @@ TG_REPO="Adieuwhine/TGuard"
 TG_BINARY="tguard"
 TG_INSTALL_DIR="/opt"
 TG_BIN_PATH="${TG_INSTALL_DIR}/${TG_BINARY}"
+TG_BIN_VERSIONED="${TG_INSTALL_DIR}/${TG_BINARY}-v${VERSION}"
 TG_LATEST_URL="https://github.com/${TG_REPO}/releases/latest/download"
 TG_DEV_MODE=false
 
@@ -66,6 +67,111 @@ check_firewall_safety() {
     fi
 }
 
+check_for_updates() {
+    local api_url="https://api.github.com/repos/${TG_REPO}/releases/latest"
+    local latest=""
+
+    if command -v curl &> /dev/null; then
+        latest=$(curl -fsSL "$api_url" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/"tag_name": *"\(.*\)"/\1/')
+    elif command -v wget &> /dev/null; then
+        latest=$(wget -qO- "$api_url" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/"tag_name": *"\(.*\)"/\1/')
+    fi
+
+    [[ -z "$latest" ]] && return 1
+
+    latest="${latest#v}"
+
+    if [ "$latest" != "$VERSION" ]; then
+        local latest_num version_num
+        latest_num=$(echo "$latest" | tr -d '.')
+        version_num=$(echo "$VERSION" | tr -d '.')
+        if [ "$latest_num" -gt "$version_num" ] 2>/dev/null; then
+            echo "$latest"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+auto_update() {
+    local new_version=$1
+    clear
+    echo -e "${CYAN}${BOLD}  🔄  ДОСТУПНО ОБНОВЛЕНИЕ${NC}"
+    echo -e "${DIM}  ──────────────────────────────────────────────${NC}\n"
+    echo -e "  Текущая версия:   ${YELLOW}v${VERSION}${NC}"
+    echo -e "  Новая версия:     ${GREEN}v${new_version}${NC}"
+    echo ""
+    echo -ne "  ${CYAN}👉  Обновить сейчас? (y/N):${NC} "
+    trap 'clear; return' INT
+    read -r ans < /dev/tty || { clear; return; }
+    trap - INT
+
+    if [[ "$ans" != "y" ]]; then
+        clear
+        return
+    fi
+
+    echo -e "\n  ${BLUE}▸ Скачивание новой версии менеджера...${NC}"
+    local tmp_manager="/tmp/tguard-manager-new.sh"
+    local manager_url="https://raw.githubusercontent.com/${TG_REPO}/main/install-tguard.sh"
+
+    if command -v curl &> /dev/null; then
+        curl -fsSL "$manager_url" -o "$tmp_manager" || {
+            echo -e "  ${RED}❌ Не удалось скачать${NC}"
+            sleep 3
+            clear
+            return
+        }
+    elif command -v wget &> /dev/null; then
+        wget -qO "$tmp_manager" "$manager_url" || {
+            echo -e "  ${RED}❌ Не удалось скачать${NC}"
+            sleep 3
+            clear
+            return
+        }
+    fi
+
+    echo -e "  ${BLUE}▸ Обновление бинарника до v${new_version}...${NC}"
+    local platform
+    platform=$(detect_system) || return 1
+    local temp_bin="/tmp/tguard-new"
+    local bin_url="https://github.com/${TG_REPO}/releases/latest/download/${TG_BINARY}-${platform}"
+
+    if command -v curl &> /dev/null; then
+        curl -fsSL "$bin_url" -o "$temp_bin" || {
+            echo -e "  ${RED}❌ Не удалось скачать бинарник${NC}"
+            sleep 3
+            clear
+            return
+        }
+    elif command -v wget &> /dev/null; then
+        wget -qO "$temp_bin" "$bin_url" || {
+            echo -e "  ${RED}❌ Не удалось скачать бинарник${NC}"
+            sleep 3
+            clear
+            return
+        }
+    fi
+
+    chmod +x "$temp_bin"
+
+    echo -e "  ${BLUE}▸ Удаление старых версий бинарника...${NC}"
+    rm -f /opt/tguard-v* 2>/dev/null
+
+    mv "$temp_bin" "/opt/tguard-v${new_version}"
+    ln -sf "/opt/tguard-v${new_version}" "${TG_BIN_PATH}"
+
+    echo -e "  ${BLUE}▸ Обновление менеджера...${NC}"
+    bash "$tmp_manager" >/dev/null 2>&1 &
+    disown
+    rm -f "$tmp_manager"
+
+    echo -e "\n  ${GREEN}✅ Обновление запущено${NC}"
+    echo -e "  ${DIM}Менеджер перезапустится через пару секунд${NC}"
+    sleep 3
+    exit 0
+}
+
 cleanup_old_install() {
     echo -e "  ${BLUE}▸ Поиск остатков старой установки...${NC}"
 
@@ -78,8 +184,17 @@ cleanup_old_install() {
         "/usr/local/sbin/tguard"
         "/bin/tguard"
         "/sbin/tguard"
+        "/tmp/tguard"
+        "/tmp/tguard-new"
     )
     for f in "${BIN_CANDIDATES[@]}"; do
+        if [[ -e "$f" ]]; then
+            FOUND+=("$f")
+            rm -f "$f"
+        fi
+    done
+
+    for f in /opt/tguard-v*; do
         if [[ -e "$f" ]]; then
             FOUND+=("$f")
             rm -f "$f"
@@ -154,11 +269,6 @@ cleanup_old_install() {
     fi
     if [ "$UFW_CHANGED" = true ]; then
         ufw reload 2>/dev/null
-    fi
-
-    if [[ -f /tmp/tguard ]]; then
-        FOUND+=("/tmp/tguard")
-        rm -f /tmp/tguard
     fi
 
     if [ ${#FOUND[@]} -eq 0 ]; then
@@ -253,9 +363,14 @@ install_binary() {
     local temp_file=$1
 
     mkdir -p "${TG_INSTALL_DIR}"
-    cp "${temp_file}" "${TG_BIN_PATH}"
-    chmod +x "${TG_BIN_PATH}"
+
+    rm -f /opt/tguard-v* 2>/dev/null
+
+    cp "${temp_file}" "${TG_BIN_VERSIONED}"
+    chmod +x "${TG_BIN_VERSIONED}"
     rm -f "${temp_file}"
+
+    ln -sf "${TG_BIN_VERSIONED}" "${TG_BIN_PATH}"
 }
 
 tg_install() {
@@ -272,16 +387,17 @@ tg_install() {
         return 1
     }
 
-    echo -e "  ${BLUE}▸ Установка в ${TG_BIN_PATH}...${NC}"
+    echo -e "  ${BLUE}▸ Установка в ${TG_BIN_VERSIONED}...${NC}"
     install_binary "${temp_file}" || {
         echo -e "\n  ${RED}❌ Ошибка установки${NC}"
         return 1
     }
+    echo -e "  ${DIM}Симлинк:${NC} ${TG_BIN_PATH} → ${TG_BIN_VERSIONED}"
 
     if [[ -x "${TG_BIN_PATH}" ]]; then
         local ver
         ver=$("${TG_BIN_PATH}" --version 2>&1 | head -n1)
-        echo -e "  ${GREEN}✅ ${TG_BINARY} установлен${NC}  ${DIM}${ver}${NC}"
+        echo -e "  ${GREEN}✅ ${TG_BINARY} v${VERSION} установлен${NC}  ${DIM}${ver}${NC}"
         return 0
     else
         echo -e "\n  ${RED}❌ Проверка установки не удалась${NC}"
@@ -398,6 +514,7 @@ uninstall_process() {
     echo -e "  ${BLUE}▸ Удаление скриптов и бинарников...${NC}"
     rm -f /usr/local/bin/antiscan-aggregate-logs.sh
     rm -f /usr/local/bin/tguard
+    rm -f /usr/local/bin/tguard-bin
     rm -f /usr/bin/tguard
     rm -f /usr/local/sbin/tguard
     rm -f /bin/tguard
@@ -405,6 +522,14 @@ uninstall_process() {
     rm -f /opt/tguard
     rm -f /opt/tguard-manual.list
     rm -f /tmp/tguard
+    rm -f /tmp/tguard-new
+
+    echo -e "  ${BLUE}▸ Удаление всех версий бинарника...${NC}"
+    for f in /opt/tguard-v*; do
+        if [[ -e "$f" ]]; then
+            rm -f "$f"
+        fi
+    done
 
     echo -e "  ${BLUE}▸ Удаление файлов ipset persistence...${NC}"
     if [[ -f /etc/ipset.conf ]] && grep -q "SCANNERS-BLOCK" /etc/ipset.conf 2>/dev/null; then
@@ -640,6 +765,7 @@ show_help() {
     echo -e "    ${GREEN}install${NC}         Установить TGuard"
     echo -e "    ${GREEN}monitor${NC}         Открыть меню управления ${DIM}(по умолчанию)${NC}"
     echo -e "    ${GREEN}update${NC}          Обновить списки блокировок"
+    echo -e "    ${GREEN}upgrade${NC}         Проверить и установить новую версию"
     echo -e "    ${RED}uninstall${NC}       Удалить TGuard и все его файлы"
     echo -e "    ${DIM}-v, --version${NC}   Показать версию"
     echo -e "    ${DIM}-h, --help${NC}      Показать эту справку"
@@ -649,8 +775,7 @@ show_help() {
     echo -e "    ${CYAN}--yes${NC}, ${CYAN}-y${NC}           Без подтверждения"
     echo ""
     echo -e "  ${BOLD}Примеры:${NC}"
-    echo -e "    ${DIM}tguard uninstall${NC}                     ${DIM}# с подтверждением, логи остаются${NC}"
-    echo -e "    ${DIM}tguard uninstall --yes${NC}               ${DIM}# без подтверждения${NC}"
+    echo -e "    ${DIM}tguard upgrade${NC}                       ${DIM}# проверить обновление${NC}"
     echo -e "    ${DIM}tguard uninstall --yes --remove-logs${NC} ${DIM}# полная очистка${NC}"
     echo ""
     exit 0
@@ -664,10 +789,46 @@ show_version() {
     echo -e "  ${BOLD}TGuard Manager${NC}  ${DIM}версия${NC} ${MAGENTA}${BOLD}v${VERSION}${NC}"
     echo -e "  ${DIM}Firewall manager для защиты от сканеров и атак${NC}"
     echo ""
+
+    local bin_ver=""
+    if [[ -x "${TG_BIN_PATH}" ]]; then
+        bin_ver=$("${TG_BIN_PATH}" --version 2>&1 | head -n1)
+        echo -e "  ${DIM}Бинарник:${NC} ${bin_ver}"
+    fi
+
+    echo ""
+    local new_ver
+    if new_ver=$(check_for_updates); then
+        echo -e "  ${YELLOW}⬆ Доступна новая версия: v${new_ver}${NC}"
+        echo -e "  ${DIM}Обновить: tguard upgrade${NC}"
+    else
+        echo -e "  ${GREEN}✓ Установлена последняя версия${NC}"
+    fi
+    echo ""
     exit 0
 }
 
+upgrade_process() {
+    local new_ver
+    if new_ver=$(check_for_updates); then
+        auto_update "$new_ver"
+    else
+        clear
+        echo -e "${CYAN}${BOLD}  🛡️   TGUARD${NC}  ${DIM}· v${VERSION}${NC}"
+        echo -e "${DIM}  ──────────────────────────────────────────────${NC}"
+        echo ""
+        echo -e "  ${GREEN}✓ Установлена последняя версия (v${VERSION})${NC}"
+        echo ""
+        sleep 2
+    fi
+}
+
 show_menu() {
+    local new_ver
+    if new_ver=$(check_for_updates); then
+        auto_update "$new_ver"
+    fi
+
     while true; do
         clear
 
@@ -690,6 +851,7 @@ show_menu() {
         echo -e "  ${GREEN}4${NC}   🧪  Управление IP        ${DIM}ban / unban${NC}"
         echo -e "  ${GREEN}5${NC}   🔄  Обновить списки     ${DIM}update${NC}"
         echo -e "  ${GREEN}6${NC}   🛠️   Переустановить      ${DIM}reinstall${NC}"
+        echo -e "  ${GREEN}8${NC}   ⬆️   Обновить версию    ${DIM}upgrade${NC}"
         echo -e "  ${RED}7${NC}   🗑️   Удалить всё         ${DIM}uninstall${NC}"
         echo ""
         echo -e "  ${DIM}0${NC}   ❌  Выход"
@@ -724,6 +886,7 @@ show_menu() {
                 FORCE_YES=false
                 uninstall_process
                 ;;
+            8) upgrade_process ;;
             0)
                 clear
                 exit 0
@@ -742,6 +905,7 @@ case "${1:-}" in
     install)      install_process ;;
     monitor)      show_menu ;;
     update)       update_lists ;;
+    upgrade)      upgrade_process ;;
     uninstall)
         shift
         while [[ $# -gt 0 ]]; do
